@@ -51,6 +51,9 @@ const stripQueryAndHash = (filename: string): string => {
     return q < 0 ? filename : filename.slice(0, basenameStart + q);
 };
 
+// Bundled SOG with the Log-Euclidean shape chart (same zip layout as .sog).
+const SOG_LE_BUNDLE = /\.sog-le-(?:codebook|minmax|hybrid)$/;
+
 const getInputFormat = (filename: string): InputFormat => {
     const lowerFilename = stripQueryAndHash(filename).toLowerCase();
 
@@ -62,7 +65,7 @@ const getInputFormat = (filename: string): InputFormat => {
         return 'splat';
     } else if (lowerFilename.endsWith('lod-meta.json')) {
         return 'lod';
-    } else if (lowerFilename.endsWith('.sog') || lowerFilename.endsWith('meta.json')) {
+    } else if (lowerFilename.endsWith('.sog') || lowerFilename.endsWith('meta.json') || SOG_LE_BUNDLE.test(lowerFilename)) {
         return 'sog';
     } else if (lowerFilename.endsWith('.ply')) {
         return 'ply';
@@ -135,7 +138,7 @@ const readFile = async (readFileOptions: ReadFileOptions): Promise<ChunkSource[]
     if (inputFormat === 'sog') {
         const lowerFilename = stripQueryAndHash(filename).toLowerCase();
         const pool = createChunkDataPool();
-        if (lowerFilename.endsWith('.sog')) {
+        if (lowerFilename.endsWith('.sog') || SOG_LE_BUNDLE.test(lowerFilename)) {
             // Outer .sog is a ZIP container - mount it and decode chunk-native
             // (textures resident, rows expanded on demand). readSogSource loads and
             // decodes every texture up front, so the zip can close once it returns.
@@ -259,7 +262,7 @@ const readFileInfo = async (readFileOptions: ReadFileOptions): Promise<FileInfo>
     // `version`) returns null from the peek and falls through to the full read.
     if (inputFormat === 'sog') {
         const lowerFilename = stripQueryAndHash(filename).toLowerCase();
-        if (lowerFilename.endsWith('.sog')) {
+        if (lowerFilename.endsWith('.sog') || SOG_LE_BUNDLE.test(lowerFilename)) {
             const source = await fileSystem.createSource(filename);
             try {
                 const zipFs = new ZipReadFileSystem(source);

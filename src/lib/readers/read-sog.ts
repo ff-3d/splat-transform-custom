@@ -18,7 +18,7 @@ import { dataTableToChunkSource, materializeToDataTable } from '../compat/data-t
 import { type DataTable } from '../data-table';
 import { basename, dirname, join, type ReadFileSystem, readFile } from '../io/read';
 import { isSplatModel, type SplatModel } from '../splat-model';
-import { logger, Transform, WebPCodec } from '../utils';
+import { decodeLogCovariance, logger, Transform, WebPCodec } from '../utils';
 import { readSogV1, type MetaV1 } from './read-sog-v1';
 
 // V2 (current) SOG meta layout - codebook-based quantization for scales /
@@ -29,10 +29,47 @@ type MetaV2 = {
     count: number;
     model?: string;
     means: { mins: number[]; maxs: number[]; files: string[] };
-    scales: { codebook: number[]; files: string[] };
-    quats: { files: string[] };
+    // standard shape coding (absent when `covariances` is present)
+    scales?: { codebook: number[]; files: string[] };
+    quats?: { files: string[]; max?: number };
+    // Log-Euclidean shape coding (.sog-le-*, see writers/write-sog-le.ts)
+    covariances?: LeMeta;
     sh0: { codebook: number[]; files: string[] };
     shN?: { count: number; bands: number; codebook: number[]; files: string[] };
+};
+
+type LeMeta = {
+    parameterization: 'log-euclidean';
+    encoding: string;
+    channels: ('codebook' | 'minmax')[];
+    codebook?: number[];
+    max?: number;
+    mins?: number[];
+    maxs?: number[];
+    files: string[];
+};
+
+// Per-channel byte -> value tables for the six LE components: a codebook
+// lookup or a min-max lerp (ffsplat simple_quantize inverse, zero range -> 1).
+const leLookupTables = (le: LeMeta): Float32Array[] => {
+    if (le.parameterization !== 'log-euclidean' || le.channels?.length !== 6) {
+        throw new Error('SOG covariances: unsupported parameterization or channel layout');
+    }
+    let mm = 0;
+    return le.channels.map((kind) => {
+        const lut = new Float32Array(256);
+        if (kind === 'codebook') {
+            const cb = le.codebook!;
+            for (let i = 0; i < 256; i++) lut[i] = cb[Math.min(i, cb.length - 1)];
+        } else {
+            const lo = le.mins![mm];
+            const range = (le.maxs![mm] - lo) || 1;
+            const max = le.max ?? 255;
+            for (let i = 0; i < 256; i++) lut[i] = lo + range * (i / max);
+            mm++;
+        }
+        return lut;
+    });
 };
 
 type ReadSogOptions = {
@@ -70,11 +107,11 @@ const SQRT2 = Math.sqrt(2);
 const tmpQuat = new Float32Array(4);
 
 // Decode a smallest-three packed quaternion into `tmpQuat` as [w, x, y, z].
-const unpackQuat = (px: number, py: number, pz: number, tag: number): void => {
+const unpackQuat = (px: number, py: number, pz: number, tag: number, qmax: number): void => {
     const maxComp = tag - 252;
-    const a = (px / 255 * 2 - 1) / SQRT2;
-    const b = (py / 255 * 2 - 1) / SQRT2;
-    const c = (pz / 255 * 2 - 1) / SQRT2;
+    const a = (px / qmax * 2 - 1) / SQRT2;
+    const b = (py / qmax * 2 - 1) / SQRT2;
+    const c = (pz / qmax * 2 - 1) / SQRT2;
     tmpQuat[0] = 0;
     tmpQuat[1] = 0;
     tmpQuat[2] = 0;
@@ -139,16 +176,39 @@ const readSogSourceV2 = async (
     const yMin = mins[1], yScale = (maxs[1] - mins[1]) || 1;
     const zMin = mins[2], zScale = (maxs[2] - mins[2]) || 1;
 
-    // quats: 4 bytes/splat, last byte is the largest-component tag (252-255).
-    const quats = decoder.decodeRGBA(await load(meta.quats.files[0]));
-    const qr = quats.rgba;
-    if (quats.width * quats.height < count) throw new Error('SOG quats texture too small for count');
+    // shape: either the standard quats + scales textures, or the two
+    // Log-Euclidean covariance textures (6 components, see leLookupTables).
+    let qr: Uint8Array | null = null;
+    let sl: Uint8Array | null = null;
+    let sCode: Float32Array | null = null;
+    const qmax = meta.quats?.max ?? 255;
+    let cv0: Uint8Array | null = null;
+    let cv1: Uint8Array | null = null;
+    let leLut: Float32Array[] | null = null;
+    if (meta.covariances) {
+        leLut = leLookupTables(meta.covariances);
+        const t0 = decoder.decodeRGBA(await load(meta.covariances.files[0]));
+        const t1 = decoder.decodeRGBA(await load(meta.covariances.files[1]));
+        if (t0.width * t0.height < count || t1.width * t1.height < count) {
+            throw new Error('SOG covariances texture too small for count');
+        }
+        cv0 = t0.rgba;
+        cv1 = t1.rgba;
+    } else {
+        if (!meta.quats || !meta.scales) throw new Error('SOG meta has neither quats/scales nor covariances');
+        // quats: 4 bytes/splat, last byte is the largest-component tag (252-255).
+        const quats = decoder.decodeRGBA(await load(meta.quats.files[0]));
+        qr = quats.rgba;
+        if (quats.width * quats.height < count) throw new Error('SOG quats texture too small for count');
 
-    // scales: 3 bytes index the shared 256-entry codebook.
-    const scales = decoder.decodeRGBA(await load(meta.scales.files[0]));
-    const sl = scales.rgba;
-    if (scales.width * scales.height < count) throw new Error('SOG scales texture too small for count');
-    const sCode = new Float32Array(meta.scales.codebook);
+        // scales: 3 bytes index the shared 256-entry codebook.
+        const scales = decoder.decodeRGBA(await load(meta.scales.files[0]));
+        sl = scales.rgba;
+        if (scales.width * scales.height < count) throw new Error('SOG scales texture too small for count');
+        sCode = new Float32Array(meta.scales.codebook);
+    }
+    const leIn = new Float64Array(6);
+    const leOut = new Float64Array(7);
 
     // sh0: 3 color bytes index the codebook; the 4th is a sigmoid'd opacity.
     const sh0 = decoder.decodeRGBA(await load(meta.sh0.files[0]));
@@ -229,16 +289,27 @@ const readSogSourceV2 = async (
 
         if (geoOut) {
             const o = r * 8; // [rot0..3, scale0..2, opacity]
-            const tag = qr[o4 + 3];
-            if (tag < 252 || tag > 255) {
-                geoOut[o] = 1; geoOut[o + 1] = 0; geoOut[o + 2] = 0; geoOut[o + 3] = 0;
+            if (leLut) {
+                leIn[0] = leLut[0][cv0![o4]];
+                leIn[1] = leLut[1][cv0![o4 + 1]];
+                leIn[2] = leLut[2][cv0![o4 + 2]];
+                leIn[3] = leLut[3][cv1![o4]];
+                leIn[4] = leLut[4][cv1![o4 + 1]];
+                leIn[5] = leLut[5][cv1![o4 + 2]];
+                decodeLogCovariance(leIn, 0, leOut, 0);
+                for (let k = 0; k < 7; k++) geoOut[o + k] = leOut[k];
             } else {
-                unpackQuat(qr[o4], qr[o4 + 1], qr[o4 + 2], tag);
-                geoOut[o] = tmpQuat[0]; geoOut[o + 1] = tmpQuat[1]; geoOut[o + 2] = tmpQuat[2]; geoOut[o + 3] = tmpQuat[3];
+                const tag = qr![o4 + 3];
+                if (tag < 252 || tag > 255) {
+                    geoOut[o] = 1; geoOut[o + 1] = 0; geoOut[o + 2] = 0; geoOut[o + 3] = 0;
+                } else {
+                    unpackQuat(qr![o4], qr![o4 + 1], qr![o4 + 2], tag, qmax);
+                    geoOut[o] = tmpQuat[0]; geoOut[o + 1] = tmpQuat[1]; geoOut[o + 2] = tmpQuat[2]; geoOut[o + 3] = tmpQuat[3];
+                }
+                geoOut[o + 4] = sCode![sl![o4]];
+                geoOut[o + 5] = sCode![sl![o4 + 1]];
+                geoOut[o + 6] = sCode![sl![o4 + 2]];
             }
-            geoOut[o + 4] = sCode[sl[o4]];
-            geoOut[o + 5] = sCode[sl[o4 + 1]];
-            geoOut[o + 6] = sCode[sl[o4 + 2]];
             geoOut[o + 7] = sigmoidInv(c0[o4 + 3] / 255);
         }
 

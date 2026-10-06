@@ -94,6 +94,7 @@ src/
 │   │   ├── write-ply.ts
 │   │   ├── write-compressed-ply.ts
 │   │   ├── write-sog.ts
+│   │   ├── write-sog-le.ts         # SOG with the Log-Euclidean shape chart (.sog-le-*)
 │   │   ├── write-csv.ts
 │   │   ├── write-html.ts
 │   │   ├── write-lod.ts
@@ -367,6 +368,10 @@ Use conventional commits:
 - `refactor: Code refactoring`
 - `test: Test updates`
 - `docs: Documentation update`
+
+## Branch Notes: Log-Euclidean SOG (`sog-le`)
+
+The `.sog-le-*` formats, the SOG rate knobs, the `tools/batch-sweep.mjs` sweep runner and the Jacobi equal-diagonal bug fix in `src/lib/utils/sym3.ts` are documented in [AGENTS-LE-Integration.md](AGENTS-LE-Integration.md). It covers design decisions, the meta.json format, verification results, environment notes and open steps. Read it before working on any of these.
 
 ## Resources
 

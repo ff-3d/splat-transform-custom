@@ -2,7 +2,7 @@ import { type ChunkDataPool, type ChunkLayer, type ChunkSource } from './chunk';
 import { materializeToDataTable } from './compat/data-table';
 import { type FileSystem } from './io/write';
 import { type DeviceCreator, type Options } from './types';
-import { writeCsv, writeGlb, writeHtml, writeImage, writeSogSource, writeSpz, writeVoxel } from './writers';
+import { writeCsv, writeGlb, writeHtml, writeImage, writeSogLeSource, writeSogSource, writeSpz, writeVoxel } from './writers';
 import { writeCompressedPlySource } from './writers/write-compressed-ply';
 import { writePlyStreaming } from './writers/write-ply-streaming';
 import { writeSplatStreaming } from './writers/write-splat-streaming';
@@ -18,13 +18,16 @@ import { writeSplatStreaming } from './writers/write-splat-streaming';
  * - `csv` - CSV text format (for debugging/analysis)
  * - `sog` - PlayCanvas SOG format (separate files)
  * - `sog-bundle` - PlayCanvas SOG format (bundled into single .sog file)
+ * - `sog-le-bundle` - SOG with the Log-Euclidean shape chart, bundled
+ *   (`.sog-le-codebook`, `.sog-le-minmax`, `.sog-le-hybrid`); unbundled LE output
+ *   is `meta.json` with `options.sogLe` set
  * - `lod` - Multi-LOD format with chunked data
  * - `html` - Self-contained HTML viewer (separate assets)
  * - `html-bundle` - Self-contained HTML viewer (all assets embedded)
  * - `voxel` - Sparse voxel octree format for collision detection
  * - `image` - Rasterized RGBA image (lossless WebP) rendered from a camera view
  */
-type OutputFormat = 'csv' | 'sog' | 'sog-bundle' | 'lod' | 'compressed-ply' | 'ply' | 'splat' | 'spz' | 'glb' | 'html' | 'html-bundle' | 'voxel' | 'image';
+type OutputFormat = 'csv' | 'sog' | 'sog-bundle' | 'sog-le-bundle' | 'lod' | 'compressed-ply' | 'ply' | 'splat' | 'spz' | 'glb' | 'html' | 'html-bundle' | 'voxel' | 'image';
 
 /**
  * Determines the output format based on file extension and options.
@@ -51,6 +54,8 @@ const getOutputFormat = (filename: string, options: Options): OutputFormat => {
         return 'lod';
     } else if (lowerFilename.endsWith('.sog')) {
         return 'sog-bundle';
+    } else if (/\.sog-le-(?:codebook|minmax|hybrid)$/.test(lowerFilename)) {
+        return 'sog-le-bundle';
     } else if (lowerFilename.endsWith('meta.json')) {
         return 'sog';
     } else if (lowerFilename.endsWith('.compressed.ply')) {
@@ -156,14 +161,32 @@ const writeSource = async (writeSourceOptions: WriteSourceOptions, fs: FileSyste
             break;
         case 'sog':
         case 'sog-bundle':
-            await writeSogSource(source, pool, {
+        case 'sog-le-bundle': {
+            const sogOptions = {
                 filename,
-                bundle: outputFormat === 'sog-bundle',
+                bundle: outputFormat !== 'sog',
                 iterations: options.iterations ?? 10,
                 webpEffort: options.webpEffort,
+                cache: options.sogEncodeCache,
                 createDevice
-            }, fs);
+            };
+            const leEncoding = outputFormat === 'sog-le-bundle' ?
+                filename.toLowerCase().match(/\.sog-le-(codebook|minmax|hybrid)$/)![1] as 'codebook' | 'minmax' | 'hybrid' :
+                outputFormat === 'sog' ? options.sogLe : undefined;
+            if (leEncoding) {
+                await writeSogLeSource(source, pool, {
+                    ...sogOptions,
+                    le: { encoding: leEncoding, codebookSize: options.sogLeCodebookSize, max: options.sogLeMax }
+                }, fs);
+            } else {
+                await writeSogSource(source, pool, {
+                    ...sogOptions,
+                    scalesCodebookSize: options.sogScalesCodebookSize,
+                    quatsMax: options.sogQuatsMax
+                }, fs);
+            }
             break;
+        }
         case 'compressed-ply':
             await writeCompressedPlySource(source, pool, { filename }, fs);
             break;

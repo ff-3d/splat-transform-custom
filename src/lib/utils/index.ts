@@ -8,3 +8,5 @@ export { RotateSH } from './rotate-sh';
 export { TextRenderer } from './text-renderer';
 export type { TextRendererOptions } from './text-renderer';
 export { WebPCodec } from './webp-codec';
+export { contentHash } from './content-hash';
+export { encodeLogCovariance, decodeLogCovariance, LE_DIAGONAL, LE_OFF_DIAGONAL, LE_MIN_ENCODE_SCALE, LE_MIN_DECODE_SCALE } from './log-euclidean';

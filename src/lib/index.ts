@@ -94,7 +94,8 @@ export type { CameraTrack, TrackPose } from './render/camera-track';
 // Utils
 export {
     fmtBytes, fmtCount, fmtTime,
-    logger, TextRenderer, Transform, WebPCodec
+    logger, TextRenderer, Transform, WebPCodec,
+    encodeLogCovariance, decodeLogCovariance
 } from './utils';
 export type { Bar, Group, LogEvent, Logger, MessageKind, Renderer, TextRendererOptions, Verbosity } from './utils';
 

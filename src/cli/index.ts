@@ -159,6 +159,11 @@ const cliOptionsConfig = {
     'sh-iterations': { type: 'string', short: 'i', default: '10' },
     'max-workers': { type: 'string' },
     'webp-effort': { type: 'string' },
+    'sog-scales-k': { type: 'string' },
+    'sog-quats-max': { type: 'string' },
+    'sog-le': { type: 'string' },
+    'sog-le-k': { type: 'string' },
+    'sog-le-max': { type: 'string' },
     'list-gpus': { type: 'boolean', default: false },
     gpu: { type: 'string', short: 'g', default: '-1' },
     'gpu-backend': { type: 'string' },
@@ -524,6 +529,24 @@ const parseArguments = async () => {
     if (webpEffort !== undefined && (webpEffort < 0 || webpEffort > 9)) {
         throw new Error(`Invalid --webp-effort value: ${v['webp-effort']}. Must be in [0, 9].`);
     }
+    const parseRangedInt = (name: 'sog-scales-k' | 'sog-quats-max' | 'sog-le-k' | 'sog-le-max', lo: number, hi: number): number | undefined => {
+        const value = v[name];
+        if (value === undefined) return undefined;
+        const n = parseInteger(value);
+        if (n < lo || n > hi) {
+            throw new Error(`Invalid --${name} value: ${value}. Must be in [${lo}, ${hi}].`);
+        }
+        return n;
+    };
+    const sogScalesCodebookSize = parseRangedInt('sog-scales-k', 1, 256);
+    const sogQuatsMax = parseRangedInt('sog-quats-max', 1, 255);
+    const sogLeCodebookSize = parseRangedInt('sog-le-k', 1, 256);
+    const sogLeMax = parseRangedInt('sog-le-max', 1, 255);
+    const sogLe = v['sog-le'] as 'codebook' | 'minmax' | 'hybrid' | undefined;
+    if (sogLe !== undefined && !['codebook', 'minmax', 'hybrid'].includes(sogLe)) {
+        throw new Error(`Invalid --sog-le value: ${sogLe}. Must be codebook, minmax or hybrid.`);
+    }
+
     // Camera animation: an editor project (.ssproj directory or its document.json),
     // viewer settings.json, or a plain frames list. Poses without a fov use --camera-fov,
     // poses without an up vector use --camera-up.
@@ -577,6 +600,11 @@ const parseArguments = async () => {
         noTty: v.tty === undefined ? undefined : !v.tty,
         iterations: parseInteger(v['sh-iterations']),
         webpEffort,
+        sogScalesCodebookSize,
+        sogQuatsMax,
+        sogLe,
+        sogLeCodebookSize,
+        sogLeMax,
         listGpus: v['list-gpus'],
         deviceIdx,
         gpuBackend,
@@ -847,13 +875,13 @@ USAGE
   • Use 'null' as output to discard file output.
 
 SUPPORTED INPUTS
-    .ply   .compressed.ply   .sog   .spz   meta.json   lod-meta.json   .ksplat   .splat   .mjs   .lcc   .lcc2
+    .ply   .compressed.ply   .sog   .sog-le-*   .spz   meta.json   lod-meta.json   .ksplat   .splat   .mjs   .lcc   .lcc2
 
     Input filenames may also be http(s):// URLs (downloaded on demand;
     .mjs generators are local-only).
 
 SUPPORTED OUTPUTS
-    .ply   .compressed.ply   .sog   .spz   meta.json   lod-meta.json   .glb   .csv   .html   .voxel.json   .webp   null
+    .ply   .compressed.ply   .sog   .sog-le-*   .spz   meta.json   lod-meta.json   .glb   .csv   .html   .voxel.json   .webp   null
 
 ACTIONS (executed in order; can be repeated)
     -t, --translate        <x,y,z>          Translate Gaussians by (x, y, z)
@@ -902,6 +930,12 @@ GPU (used by SOG compression and GPU voxelization: --filter-cluster, --filter-fl
 SOG COMPRESSION (.sog, meta.json, lod-meta.json, .html outputs)
     -i, --sh-iterations    <n>              SH compression iterations (more=better). Default: 10
         --max-workers      <n>              Worker threads for SOG and image-sequence encoding (0 = inline/serial). Default: 4
+        --sog-scales-k     <n>              Scale codebook entries (1-256). Default: 256
+        --sog-quats-max    <n>              Quaternion component levels - 1 (1-255). Default: 255
+        --sog-le           <mode>           Log-Euclidean shape chart for meta.json output: codebook | minmax | hybrid
+                                              (bundled: .sog-le-codebook / .sog-le-minmax / .sog-le-hybrid)
+        --sog-le-k         <n>              Log-Euclidean codebook entries (codebook, hybrid). Default: 256
+        --sog-le-max       <n>              Log-Euclidean min-max levels - 1 (minmax, hybrid). Default: 255
 
 SPZ OUTPUT (.spz)
         --spz-version      <3|4>            The SPZ format version to write. Default: 4
@@ -1533,3 +1567,5 @@ const main = async () => {
 };
 
 export { main };
+export { batchSweep } from './batch-sweep';
+export type { BatchSweepOptions, SweepManifest } from './batch-sweep';

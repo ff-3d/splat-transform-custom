@@ -1,0 +1,36 @@
+# .sog vs .sog-le rate sweeps (see tools/batch-sweep.mjs).
+#
+# Keys: scales.k / quats.max (sog), cov.k (sog-le-codebook, sog-le-hybrid),
+# cov.max (sog-le-minmax, sog-le-hybrid), sh.iterations, webp.effort.
+# `max` follows ffsplat simple_quantize (values 0..max, levels = max + 1);
+# `k` is a codebook size (<= 256). Defaults: k = 256, max = 255 (deployed .sog).
+groups:
+  - id: sog
+    output_format: sog
+    sweep_mode: zip
+    axes:
+      - key: scales.k
+        values: [256, 200, 150, 100, 50]
+      - key: quats.max
+        values: [255, 200, 150, 100, 50]
+
+  - id: sog-le-codebook
+    output_format: sog-le-codebook
+    axes:
+      - key: cov.k
+        values: [256, 200, 150, 100, 50]
+
+  - id: sog-le-minmax
+    output_format: sog-le-minmax
+    axes:
+      - key: cov.max
+        values: [50, 56, 62, 72, 75, 100, 150, 200, 255]
+
+  - id: sog-le-hybrid
+    output_format: sog-le-hybrid
+    sweep_mode: zip
+    axes:
+      - key: cov.k
+        values: [256, 200, 150, 100, 50]
+      - key: cov.max
+        values: [255, 200, 150, 100, 50]

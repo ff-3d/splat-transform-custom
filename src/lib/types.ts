@@ -20,6 +20,28 @@ type Options = {
     /** Lossless WebP compression effort for image, SOG, HTML and LOD output, 0–9. Omit to use the default WebP encoder. */
     webpEffort?: number;
 
+    /** SOG scale codebook entries (1-256). Default: 256 */
+    sogScalesCodebookSize?: number;
+
+    /** SOG quaternion component levels - 1 (1-255). Default: 255 */
+    sogQuatsMax?: number;
+
+    /** Encode SOG shape with the Log-Euclidean chart (`.sog-le-*` / meta.json output). Default: standard quats + scales */
+    sogLe?: 'codebook' | 'minmax' | 'hybrid';
+
+    /** Log-Euclidean SOG codebook entries (1-256), for `codebook` / `hybrid`. Default: 256 */
+    sogLeCodebookSize?: number;
+
+    /** Log-Euclidean SOG min-max levels - 1 (1-255), for `minmax` / `hybrid`. Default: 255 */
+    sogLeMax?: number;
+
+    /**
+     * Memo shared across repeated SOG writes of one scene (parameter sweeps):
+     * SH k-means and unchanged WebP textures are computed once. Keys are
+     * content hashes; results stay resident for the map's lifetime.
+     */
+    sogEncodeCache?: Map<string, Promise<unknown>>;
+
     /** LOD levels to read from LCC input. Default: all levels. */
     lodSelect?: number[];
 

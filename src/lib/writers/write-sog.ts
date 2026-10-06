@@ -14,7 +14,7 @@ import { sortMortonInterleaved } from '../ops/morton-order';
 import { kmeansInterleaved } from '../spatial';
 import { type SplatModel } from '../splat-model';
 import type { DeviceCreator } from '../types';
-import { logger, sigmoid, Transform } from '../utils';
+import { contentHash, logger, sigmoid, Transform } from '../utils';
 import { version } from '../version';
 import { runEncodeWebp, runQuantize1dColumns } from '../workers';
 
@@ -104,6 +104,92 @@ const gatherSogLayers = async (source: ChunkSource, pool: ChunkDataPool): Promis
     return { position, geometric, colorDc, shRest };
 };
 
+/**
+ * Memo for deterministic encode stages, shared across repeated writes of the
+ * same scene (e.g. a parameter sweep). Keys are content hashes, so textures and
+ * SH palettes that a variant does not change are encoded once.
+ *
+ * @ignore
+ */
+type SogEncodeCache = Map<string, Promise<unknown>>;
+
+/**
+ * What a shape encoder sees: the gathered geometric columns and the writer's
+ * texture helpers. Writes must be pushed onto `pending` (not awaited) so they
+ * commit in call order alongside the other textures.
+ *
+ * @ignore
+ */
+type SogShapeContext = {
+    /** One column per `GEOMETRIC_COLS` entry: rot_0..3, scale_0..2, opacity. */
+    geometric: Float32Array[];
+    numRows: number;
+    /** Byte size of one RGBA texture (width * height * 4). */
+    textureBytes: number;
+    pending: Promise<void>[];
+    writeWebp: (filename: string, data: Uint8Array) => Promise<void>;
+    writeLabels: (filename: string, cols: Uint8Array[], indices: Uint32Array) => Promise<void>;
+};
+
+/**
+ * Encodes the shape (rotation + scale) textures. Called before the Morton sort
+ * so worker-side jobs can start early; the returned function runs once the
+ * texel order is known and resolves to the shape's meta.json entries.
+ *
+ * @ignore
+ */
+type SogShapeEncoder = (ctx: SogShapeContext) => (indices: Uint32Array) => Promise<Record<string, unknown>>;
+
+// Standard SOG shape coding: largest-3 packed quaternions (8-bit components,
+// `quatsMax` levels - 1) + log-scales indexing one shared 1D codebook of
+// `scalesCodebookSize` entries. The defaults (255, 256) are the deployed format.
+const stdShapeEncoder = (scalesCodebookSize = 256, quatsMax = 255): SogShapeEncoder => (ctx) => {
+    const [r0, r1, r2, r3, s0, s1, s2] = ctx.geometric;
+    const scalesQuant = runQuantize1dColumns([
+        { name: 'scale_0', data: s0 }, { name: 'scale_1', data: s1 }, { name: 'scale_2', data: s2 }
+    ], scalesCodebookSize);
+    scalesQuant.catch(() => {});
+
+    return async (indices) => {
+        // ---- quats: largest-3 packed quaternions.
+        const numRows = ctx.numRows;
+        const quats = new Uint8Array(ctx.textureBytes);
+        const q = [0, 0, 0, 0];
+        const sqrt2 = Math.sqrt(2);
+        // Largest-3 component orders, indexed by the dropped component.
+        const quatIdx = [[1, 2, 3], [0, 2, 3], [0, 1, 3], [0, 1, 2]];
+        for (let i = 0; i < numRows; ++i) {
+            const g = indices[i];
+            q[0] = r0[g]; q[1] = r1[g]; q[2] = r2[g]; q[3] = r3[g];
+            const l = Math.sqrt(q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3]);
+            q[0] /= l; q[1] /= l; q[2] /= l; q[3] /= l;
+            let maxComp = 0;
+            if (Math.abs(q[1]) > Math.abs(q[maxComp])) maxComp = 1;
+            if (Math.abs(q[2]) > Math.abs(q[maxComp])) maxComp = 2;
+            if (Math.abs(q[3]) > Math.abs(q[maxComp])) maxComp = 3;
+            const s = (q[maxComp] < 0 ? -1 : 1) * sqrt2;
+            q[0] *= s; q[1] *= s; q[2] *= s; q[3] *= s;
+            const idx = quatIdx[maxComp];
+            const ti = i;
+            quats[ti * 4]     = quatsMax * (q[idx[0]] * 0.5 + 0.5);
+            quats[ti * 4 + 1] = quatsMax * (q[idx[1]] * 0.5 + 0.5);
+            quats[ti * 4 + 2] = quatsMax * (q[idx[2]] * 0.5 + 0.5);
+            quats[ti * 4 + 3] = 252 + maxComp;
+        }
+        ctx.pending.push(ctx.writeWebp('quats.webp', quats));
+
+        // ---- scales: quantized log-scales.
+        const sd = await scalesQuant;
+        ctx.pending.push(ctx.writeLabels('scales.webp', sd.labels.map(c => c.data), indices));
+
+        return {
+            scales: { codebook: Array.from(sd.centroids), files: ['scales.webp'] },
+            // the deployed 8-bit layout stays byte-identical (no `max` entry)
+            quats: quatsMax === 255 ? { files: ['quats.webp'] } : { max: quatsMax, files: ['quats.webp'] }
+        };
+    };
+};
+
 type WriteSogSourceOptions = {
     filename: string;
     bundle: boolean;
@@ -119,6 +205,14 @@ type WriteSogSourceOptions = {
     // upstream (`filterSource` / `gatherRows`) so the source *is* the subset,
     // then pass its within-source ordering here.
     indices?: Uint32Array;
+    /** Scale codebook size (1-256) for the standard shape coding. Default 256. */
+    scalesCodebookSize?: number;
+    /** Quaternion component levels - 1 (1-255) for the standard shape coding. Default 255. */
+    quatsMax?: number;
+    /** Replaces the standard quats/scales coding (e.g. the Log-Euclidean chart). */
+    shapeEncoder?: SogShapeEncoder;
+    /** Memo shared across writes; see {@link SogEncodeCache}. */
+    cache?: SogEncodeCache;
 };
 
 type ShNMeta = { count: number; bands: number; codebook: number[]; files: string[] };
@@ -205,9 +299,23 @@ const writeSogSource = async (
     // encodes run concurrently and each awaits inside its chained section.
     let writeChain: Promise<void> = Promise.resolve();
 
+    const { cache } = options;
+    const memo = <T>(key: string, fn: () => Promise<T>): Promise<T> => {
+        if (!cache) return fn();
+        let hit = cache.get(key) as Promise<T> | undefined;
+        if (!hit) {
+            hit = fn();
+            cache.set(key, hit);
+        }
+        return hit;
+    };
+
     const writeWebp = (filename: string, data: Uint8Array, w = width, h = height): Promise<void> => {
         const pathname = zipFs ? filename : resolve(dirname(outputFilename), filename);
-        const encoded = runEncodeWebp(data, w, h, webpEffort);
+        // hash before the encode: runEncodeWebp transfers (detaches) `data`
+        const encoded = cache ?
+            memo(`webp:${w}x${h}:${webpEffort ?? ''}:${contentHash(data)}`, () => runEncodeWebp(data, w, h, webpEffort)) :
+            runEncodeWebp(data, w, h, webpEffort);
         const write = writeChain.then(async () => {
             const webp = await encoded;
             await writeFile(outputFs, pathname, webp);
@@ -245,24 +353,33 @@ const writeSogSource = async (
         // ---- Worker-side jobs first, so the pool is busy while the main thread
         // runs its own passes below. Quantize-bearing textures go first (each
         // is a full-column pass); SH k-means mostly waits on the GPU.
-        const [r0, r1, r2, r3, s0, s1, s2, op] = layers.geometric;
+        const op = layers.geometric[7];
         const [fdc0, fdc1, fdc2] = layers.colorDc;
-        const scalesQuant = runQuantize1dColumns([
-            { name: 'scale_0', data: s0 }, { name: 'scale_1', data: s1 }, { name: 'scale_2', data: s2 }
-        ]);
+        const shapeEncoder = options.shapeEncoder ?? stdShapeEncoder(options.scalesCodebookSize, options.quatsMax);
+        const finishShape = shapeEncoder({
+            geometric: layers.geometric,
+            numRows,
+            textureBytes: width * height * channels,
+            pending,
+            writeWebp: (filename, data) => writeWebp(filename, data),
+            writeLabels
+        });
         const colorsQuant = runQuantize1dColumns([
             { name: 'f_dc_0', data: fdc0 }, { name: 'f_dc_1', data: fdc1 }, { name: 'f_dc_2', data: fdc2 }
         ]);
         const restCount = [0, 9, 24, 45][shBands];
         const paletteSize = Math.min(64, 2 ** Math.floor(Math.log2(numRows / 1024))) * 1024;
-        const shCluster = shBands > 0 ? (async () => {
-            const gpuDevice = createDevice ? await createDevice() : undefined;
-            return kmeansInterleaved(layers.shRest, numRows, restCount, paletteSize, iterations, gpuDevice);
-        })() : null;
+        const shCluster = shBands > 0 ? memo(
+            cache ? `kmeans:${restCount}:${paletteSize}:${iterations}:${contentHash(layers.shRest)}` : '',
+            async () => {
+                const gpuDevice = createDevice ? await createDevice() : undefined;
+                return kmeansInterleaved(layers.shRest, numRows, restCount, paletteSize, iterations, gpuDevice);
+            }
+        ) : null;
         // If the main thread throws below, these settle later; mark their
         // rejections handled so the original error propagates instead of an
         // unhandled rejection.
-        [scalesQuant, colorsQuant, shCluster].forEach(p => p?.catch(() => {}));
+        [colorsQuant, shCluster].forEach(p => p?.catch(() => {}));
 
         // ---- means: Morton order (unless a caller-supplied order is used) +
         // log-encoded positions split into low/high bytes.
@@ -300,38 +417,8 @@ const writeSogSource = async (
             return { mins: minMax.map(v => v[0]), maxs: minMax.map(v => v[1]) };
         })();
 
-        // ---- quats: largest-3 packed quaternions.
-        {
-            const quats = new Uint8Array(width * height * channels);
-            const q = [0, 0, 0, 0];
-            const sqrt2 = Math.sqrt(2);
-            // Largest-3 component orders, indexed by the dropped component.
-            const quatIdx = [[1, 2, 3], [0, 2, 3], [0, 1, 3], [0, 1, 2]];
-            for (let i = 0; i < numRows; ++i) {
-                const g = indices[i];
-                q[0] = r0[g]; q[1] = r1[g]; q[2] = r2[g]; q[3] = r3[g];
-                const l = Math.sqrt(q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3]);
-                q[0] /= l; q[1] /= l; q[2] /= l; q[3] /= l;
-                let maxComp = 0;
-                if (Math.abs(q[1]) > Math.abs(q[maxComp])) maxComp = 1;
-                if (Math.abs(q[2]) > Math.abs(q[maxComp])) maxComp = 2;
-                if (Math.abs(q[3]) > Math.abs(q[maxComp])) maxComp = 3;
-                const s = (q[maxComp] < 0 ? -1 : 1) * sqrt2;
-                q[0] *= s; q[1] *= s; q[2] *= s; q[3] *= s;
-                const idx = quatIdx[maxComp];
-                const ti = i;
-                quats[ti * 4]     = 255 * (q[idx[0]] * 0.5 + 0.5);
-                quats[ti * 4 + 1] = 255 * (q[idx[1]] * 0.5 + 0.5);
-                quats[ti * 4 + 2] = 255 * (q[idx[2]] * 0.5 + 0.5);
-                quats[ti * 4 + 3] = 252 + maxComp;
-            }
-            pending.push(writeWebp('quats.webp', quats));
-        }
-
-        // ---- scales: quantized log-scales.
-        const sd = await scalesQuant;
-        pending.push(writeLabels('scales.webp', sd.labels.map(c => c.data), indices));
-        const scalesCodebook = Array.from(sd.centroids);
+        // ---- shape: quats + scales (or the encoder's replacement textures).
+        const shapeMeta = await finishShape(indices);
 
         // ---- sh0: quantized DC + sigmoid(opacity).
         const opacityData = new Uint8Array(numRows);
@@ -402,8 +489,7 @@ const writeSogSource = async (
             // untagged scenes stay byte-identical to pre-3.2 output
             ...(meta.model === 'default' ? {} : { model: meta.model }),
             means: { mins: meansMeta.mins, maxs: meansMeta.maxs, files: ['means_l.webp', 'means_u.webp'] },
-            scales: { codebook: scalesCodebook, files: ['scales.webp'] },
-            quats: { files: ['quats.webp'] },
+            ...shapeMeta,
             sh0: { codebook: colorsCodebook, files: ['sh0.webp'] },
             ...(shN ? { shN } : {})
         };
@@ -455,3 +541,4 @@ const writeSog = async (options: WriteSogOptions, fs: FileSystem): Promise<void>
 };
 
 export { writeSog, writeSogSource };
+export type { SogEncodeCache, SogShapeContext, SogShapeEncoder, WriteSogSourceOptions };
