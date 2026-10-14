@@ -169,10 +169,10 @@ describe('Log-Euclidean chart', () => {
         assert(Math.abs(norm2 - (4 + 16 + 36)) < 1e-9);
     });
 
-    it('applies the ffsplat clamps (encode 1e-20, decode 1e-10)', () => {
+    it('applies the scale floors (encode 1e-10, decode 1e-10)', () => {
         const v = new Float64Array(6);
         encodeLogCovariance(1, 0, 0, 0, -200, -1, -2, v);
-        assert(Math.abs(v[0] - 2 * Math.log(1e-20)) < 1e-9);
+        assert(Math.abs(v[0] - 2 * Math.log(1e-10)) < 1e-9);
         const out = new Float64Array(7);
         decodeLogCovariance([-100, 0, 0, -1, 0, -2], 0, out);
         assert(Math.abs(out[4] - Math.log(1e-10)) < 1e-9);

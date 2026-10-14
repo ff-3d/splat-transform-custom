@@ -2,9 +2,10 @@
 // covariance, stored as its 6-value upper triangle. Mirrors ffsplat's
 // `build_covariance(apply_log) + symmetric_to_triu(preserve_norm)` encode and
 // `triu_to_symmetric + decompose_covariance(apply_exp)` decode
-// (SOG-XT-1510-logmap), including its clamping thresholds:
+// (SOG-XT-1510-logmap), including its clamping thresholds (encode and decode
+// share one floor):
 //
-//   encode: log Σ = R diag(2 log max(s, 1e-20)) Rᵀ
+//   encode: log Σ = R diag(2 log max(s, 1e-10)) Rᵀ
 //   decode: eigh(log Σ) -> s = max(exp(λ / 2), 1e-10), R = eigenvectors (det fixed to +1)
 //
 // Component order is torch.triu_indices(3, 3): [xx, xy, xz, yy, yz, zz]. The
@@ -13,10 +14,10 @@
 
 import { eigenSymmetric3x3, rotmatToQuat } from './sym3';
 
-/** Smallest scale fed to the log on encode (ffsplat `clamp_min(1e-20)`). */
-const LE_MIN_ENCODE_SCALE = 1e-20;
 /** Smallest scale produced on decode (ffsplat `clamp(min=1e-10)`). */
 const LE_MIN_DECODE_SCALE = 1e-10;
+/** Smallest scale fed to the log on encode (ffsplat `clamp_min(1e-10)`, = the decode floor). */
+const LE_MIN_ENCODE_SCALE = LE_MIN_DECODE_SCALE;
 
 const LN_MIN_ENCODE_SCALE = Math.log(LE_MIN_ENCODE_SCALE);
 const LN_MIN_DECODE_SCALE = Math.log(LE_MIN_DECODE_SCALE);
@@ -58,7 +59,7 @@ const encodeLogCovariance = (
     const r10 = 2 * (x * y + w * z), r11 = 1 - 2 * (x * x + z * z), r12 = 2 * (y * z - w * x);
     const r20 = 2 * (x * z - w * y), r21 = 2 * (y * z + w * x), r22 = 1 - 2 * (x * x + y * y);
 
-    // 2 log max(s, 1e-20), with s = exp(l)
+    // 2 log max(s, 1e-10), with s = exp(l)
     const d0 = 2 * Math.max(l0, LN_MIN_ENCODE_SCALE);
     const d1 = 2 * Math.max(l1, LN_MIN_ENCODE_SCALE);
     const d2 = 2 * Math.max(l2, LN_MIN_ENCODE_SCALE);

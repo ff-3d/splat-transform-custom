@@ -11,8 +11,8 @@ Reference implementation: ffsplat (`references/ffsplat-dev`, gitignored; clone i
 ## Design decisions (agreed with the user)
 
 1. **Keep everything else in `.sog` identical.** That covers Morton order (not PLAS), means (16-bit log split), sh0 + opacity, shN k-means palette, and WebP lossless. Only `quats.webp` + `scales.webp` are replaced by `cov_0.webp` + `cov_1.webp`.
-2. **The LE math matches ffsplat exactly**, including its clamps:
-   - encode: `log Σ = R diag(2·log max(s, 1e-20)) Rᵀ`; upper triangle in `torch.triu_indices(3,3)` order `[xx, xy, xz, yy, yz, zz]`; off-diagonals ×√2 (`preserve_norm`), so the L2 norm of the vector equals ‖log Σ‖_F.
+2. **The LE math matches ffsplat exactly**, including its clamps (encode and decode share the `1e-10` scale floor):
+   - encode: `log Σ = R diag(2·log max(s, 1e-10)) Rᵀ`; upper triangle in `torch.triu_indices(3,3)` order `[xx, xy, xz, yy, yz, zz]`; off-diagonals ×√2 (`preserve_norm`), so the L2 norm of the vector equals ‖log Σ‖_F.
    - decode: undo √2; symmetric eigendecomposition with eigenvalues **ascending** (eigh order); flip the **first** eigenvector if det < 0; `s = max(exp(λ/2), 1e-10)`; quaternion from the eigenvector matrix, canonicalized to w ≥ 0.
 3. **Three quantization modes**, all 8-bit indices, in two RGB textures (`cov_0` = xx,xy,xz; `cov_1` = yy,yz,zz, the ffsplat 6D→2×3D split):
    - `codebook` (**primary paper row**): one shared 1D codebook (`quantize1dColumns`, the same quantizer `.sog` uses for scales, same α = 0.5) over all 6 coordinates. It has the same side info as `.sog` (one 256-entry codebook) and the same index bits. With the √2 scaling, its squared-error objective is the density-weighted LE distortion D_LE. Sharing one table is justified by the chart: a world rotation mixes the 6 LE coordinates orthogonally (R5), so they are commensurate.
